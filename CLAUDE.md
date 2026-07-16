@@ -33,15 +33,23 @@ again after changing container user/permissions.
   default in docker-compose.yml is `llama3.1:8b-instruct-q4_K_M`, which fits comfortably in
   the 16GB RAM budget — see README's "Design decisions" section for the quantization tradeoff.
 
+Monitoring integration added (2026-07-16, sysadmin track part B): a `/metrics` Prometheus
+endpoint (API-key protected — request volume/activity is more sensitive than the bare
+up/down `/health` check) exposing `rag_http_requests_total{endpoint,status}`,
+`rag_documents_ingested_total`, `rag_chat_requests_total`, and a live-checked
+`rag_ollama_up` gauge. Plus `zabbix/template_local_rag_assistant_metrics.yaml`, following
+the exact conventions of the existing `keycloak-zabbix-monitoring` repo (HTTP agent master
+item + Prometheus-pattern dependent items + triggers), reusing its Google Chat webhook
+media type for alert routing rather than standing up a new one. Verified live: auth
+enforced, business counters increment correctly on real ingest/chat calls, and the
+route-template label (`/api/sources/{source}`) avoids per-filename cardinality blowup.
+
 ## Remaining/optional work (not started, not blocking)
 - No conversation persistence — chat history lives only in the browser tab.
 - No reranking step — plain top-k cosine similarity via sqlite-vec; would matter more at a
   much larger document count than this is designed for.
+- No test suite (pytest etc.) — everything verified via live docker-compose/curl smoke tests.
 - Portfolio site (`~/portfolio-site/projects/`) does not yet have an entry linking to this repo.
-- CI workflow (`.github/workflows/ci.yml`) is written and locally verified (ruff, pip-audit,
-  and a manual Trivy scan against the built image all pass) but has never actually run in
-  GitHub Actions — no remote configured yet for this repo.
-- Other DevOps/sysadmin hardening tracks discussed but not done: CI beyond lint/scan (no test
-  suite exists yet), a systemd/bare-metal deployment path, and wiring monitoring into the
-  existing `keycloak-zabbix-monitoring` repo. See [[user_job_search]] memory for the full list
-  if resuming this.
+- The Zabbix template has never been imported into a real Zabbix instance and verified end
+  to end — it's been validated for YAML correctness and consistency with the existing
+  keycloak template's conventions, but not exercised against live Zabbix.

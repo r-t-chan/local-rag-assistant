@@ -11,6 +11,7 @@ dependencies = [
     "python-multipart>=0.0.12",
     "sqlite-vec>=0.1.6",
     "slowapi>=0.1.9",
+    "prometheus-client>=0.21",
 ]
 
 [dependency-groups]

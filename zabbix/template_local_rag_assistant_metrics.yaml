@@ -1,0 +1,151 @@
+# Zabbix template: Local RAG Assistant via Prometheus metrics
+# Tested against Zabbix 6.x export format (simplified for readability).
+# Same pattern as ../keycloak-zabbix-monitoring/zabbix/template_keycloak_metrics.yaml —
+# one HTTP agent master item scrapes /metrics, dependent items extract series via
+# Prometheus pattern preprocessing, triggers fire on the conditions that matter.
+
+zabbix_export:
+  version: '6.0'
+  templates:
+    - uuid: 0c61e94ceac447fc9e59d4d0bc56e43e
+      template: 'Local RAG Assistant by Prometheus metrics'
+      name: 'Local RAG Assistant by Prometheus metrics'
+      groups:
+        - name: Templates/Applications
+      macros:
+        - macro: '{$RAG.METRICS.URL}'
+          value: 'http://127.0.0.1:8001/metrics'
+          description: >-
+            Full URL of the app's /metrics endpoint. The app binds to
+            127.0.0.1 by default (see docker-compose.yml) — either run the
+            Zabbix agent/proxy on the same host, or deliberately expose the
+            port if the Zabbix server is elsewhere.
+        - macro: '{$RAG.API_KEY}'
+          type: SECRET_TEXT
+          value: 'changeme'
+          description: 'API key sent as the X-API-Key header — /metrics is auth-protected like the rest of the API.'
+        - macro: '{$RAG.5XX.WARN}'
+          value: '0.05'
+          description: '5xx responses/sec sustained over 5m before alerting'
+        - macro: '{$RAG.RATELIMIT.WARN}'
+          value: '0.05'
+          description: '429 (rate-limited) responses/sec sustained over 5m before alerting — a sustained rate suggests scripted abuse, not a one-off burst'
+
+      items:
+        # ── Master item: one scrape, everything else depends on it ──
+        - uuid: 0c4524802f9d41dc9142f3cbd53ba7f3
+          name: 'RAG assistant: raw metrics scrape'
+          type: HTTP_AGENT
+          key: rag.metrics.raw
+          url: '{$RAG.METRICS.URL}'
+          headers:
+            - name: X-API-Key
+              value: '{$RAG.API_KEY}'
+          delay: 1m
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+
+        # ── Dependent items (Prometheus pattern preprocessing) ──
+        - uuid: 5b3cdc9e6fb2400d8655d4531b4b7e42
+          name: 'RAG assistant: HTTP 5xx responses'
+          type: DEPENDENT
+          key: rag.http.5xx
+          master_item:
+            key: rag.metrics.raw
+          value_type: FLOAT
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'rag_http_requests_total{status=~"5.."}'
+                - 'sum'
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters: []
+
+        - uuid: 15428864248640378f21aa26d1c7a709
+          name: 'RAG assistant: rate-limit rejections (429s)'
+          type: DEPENDENT
+          key: rag.ratelimit.rejections
+          master_item:
+            key: rag.metrics.raw
+          value_type: FLOAT
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'rag_http_requests_total{status="429"}'
+                - 'sum'
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters: []
+
+        - uuid: cdde9642821342f9aca27a9073deb0de
+          name: 'RAG assistant: Ollama backend reachable'
+          type: DEPENDENT
+          key: rag.ollama.up
+          master_item:
+            key: rag.metrics.raw
+          value_type: FLOAT
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'rag_ollama_up'
+                - 'value'
+                - ''
+
+        # Usage/capacity trends — informational, not alerted on
+        - uuid: 5c7c519134c240c08b889259f66843ad
+          name: 'RAG assistant: documents ingested (rate)'
+          type: DEPENDENT
+          key: rag.documents.ingested.rate
+          master_item:
+            key: rag.metrics.raw
+          value_type: FLOAT
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'rag_documents_ingested_total'
+                - 'value'
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters: []
+
+        - uuid: 0419fd51d7ec41fe978d9838cb67d0de
+          name: 'RAG assistant: chat requests (rate)'
+          type: DEPENDENT
+          key: rag.chat.requests.rate
+          master_item:
+            key: rag.metrics.raw
+          value_type: FLOAT
+          preprocessing:
+            - type: PROMETHEUS_PATTERN
+              parameters:
+                - 'rag_chat_requests_total'
+                - 'value'
+                - ''
+            - type: CHANGE_PER_SECOND
+              parameters: []
+
+      triggers:
+        - uuid: d707de6fddc841258d7ddf6290e7d536
+          expression: 'min(/Local RAG Assistant by Prometheus metrics/rag.http.5xx,5m)>{$RAG.5XX.WARN}'
+          name: 'RAG assistant: elevated 5xx rate'
+          priority: HIGH
+          description: 'Sustained server errors — check app logs (journalctl -u local-rag-assistant or docker compose logs app) for the actual exception.'
+
+        - uuid: 28e04ac8ad824a90857a14f7a42979f4
+          expression: 'last(/Local RAG Assistant by Prometheus metrics/rag.ollama.up)=0'
+          name: 'RAG assistant: Ollama backend unreachable'
+          priority: HIGH
+          description: 'The app is up but its model server is not — every /api/chat and /api/ingest call will fail. Check the ollama container/service directly.'
+
+        - uuid: 25c0acea6b2d4c1585c252c478ae8e2e
+          expression: 'min(/Local RAG Assistant by Prometheus metrics/rag.ratelimit.rejections,5m)>{$RAG.RATELIMIT.WARN}'
+          name: 'RAG assistant: sustained rate-limit rejections (possible abuse)'
+          priority: WARNING
+          description: 'A real user hitting the rate limit is a one-off burst; a sustained rate over 5 minutes looks more like scripted abuse against the API key.'
+
+        - uuid: 5a8e458c00654d0ab3f276141c7cdb84
+          expression: 'nodata(/Local RAG Assistant by Prometheus metrics/rag.metrics.raw,5m)=1'
+          name: 'RAG assistant: metrics endpoint unreachable'
+          priority: AVERAGE
