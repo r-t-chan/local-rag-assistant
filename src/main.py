@@ -1,7 +1,10 @@
 import json
+import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +14,11 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from . import ingest, llm, rag
+from .logging_config import configure_logging
 from .security import limiter, safe_filename, validate_upload, verify_api_key
+
+configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("local_rag_assistant")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -19,6 +26,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     rag.init_db()
+    logger.info("startup complete")
     yield
 
 
@@ -47,6 +55,20 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/health")
+async def health():
+    """Unauthenticated liveness/readiness probe for the container orchestrator —
+    checks that Ollama is actually reachable, not just that this process is up."""
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{llm.OLLAMA_HOST}/api/tags")
+            resp.raise_for_status()
+    except httpx.HTTPError:
+        logger.warning("health check failed: ollama unreachable")
+        raise HTTPException(503, "ollama unreachable")
+    return {"status": "ok"}
+
+
 @app.get("/api/sources", dependencies=[Depends(verify_api_key)])
 def sources():
     return {"sources": rag.list_sources()}
@@ -67,6 +89,7 @@ async def ingest_endpoint(request: Request, file: UploadFile = File(...)):
     filename = safe_filename(file.filename)
     validate_upload(filename, content)
     n_chunks = await ingest.ingest_file(filename, content)
+    logger.info("document ingested", extra={"source": filename, "chunk_count": n_chunks})
     return {"filename": filename, "chunks": n_chunks}
 
 
@@ -79,6 +102,10 @@ async def chat(request: Request, req: ChatRequest):
         f"[{r['source']} chunk {r['chunk_index']}]\n{r['text']}" for r in results
     )
     sources_used = sorted({r["source"] for r in results})
+    logger.info(
+        "chat request",
+        extra={"retrieved_count": len(results), "source_count": len(sources_used)},
+    )
 
     messages = [
         {

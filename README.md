@@ -97,6 +97,22 @@ All `/api/*` endpoints require an `X-API-Key` header (see Security below).
 | `/api/sources` | GET | List ingested document names |
 | `/api/sources/{name}` | DELETE | Remove a document and its chunks |
 | `/api/chat` | POST | `{message, history}` → SSE stream of `{type: sources|token|done}` events. Rate-limited to 30/min. |
+| `/health` | GET | Unauthenticated. Checks the app process is up *and* Ollama is actually reachable — used by the Compose healthcheck. |
+
+## Operations
+
+- **Healthchecks**: both containers have Docker healthchecks (`ollama list` for Ollama,
+  a request to `/health` for the app). `app` won't start until Ollama reports healthy
+  (`depends_on.condition: service_healthy`), so there's no window where the app is up but
+  can't reach the model yet.
+- **Resource limits**: `mem_limit`/`cpus` are set on both services — Ollama's ceiling
+  (10GB) is sized for one 7-8B Q4 model plus the embedding model loaded concurrently,
+  inside a 16GB host budget; raise it if you configure a larger model.
+- **Structured logging**: all logs are single-line JSON (`src/logging_config.py`) —
+  timestamp, level, logger, message, plus any extra fields (e.g. `chunk_count` on
+  ingest, `retrieved_count` on chat). Deliberately does **not** log document content or
+  chat message text, consistent with this being a privacy-focused tool. Set `LOG_LEVEL`
+  to change verbosity.
 
 ## Security
 
