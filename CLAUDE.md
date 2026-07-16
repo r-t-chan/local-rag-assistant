@@ -12,6 +12,17 @@ all verified via `docker compose up` + manual curl tests. Not yet deployed anywh
 it's a local Docker Compose app, not a hosted web service (that's a deliberate scope choice:
 the point is "runs on your own hardware," so there's nothing to host).
 
+Security hardening pass complete (2026-07-16): API-key auth on all `/api/*` routes, rate
+limiting (slowapi), upload validation (extension allowlist + size cap + magic bytes), Ollama's
+port no longer published to the host, app container runs non-root/read-only/cap-dropped,
+multi-stage Docker build (no `pip`/`uv` in the final image), and CI (`pip-audit` + Trivy image
+scan). This was a deliberate pivot from "AI engineering demo" toward "DevOps/security portfolio
+piece" — see README's new Security section for the full threat model. All of it verified live
+(not just written), including a real bug caught during testing: a stale root-owned sqlite file
+from before the non-root user change broke writes under `read_only: true` until removed —
+worth remembering if `data/db/vectors.db` ever throws "attempt to write a readonly database"
+again after changing container user/permissions.
+
 ## Environment notes
 - Developed on WSL2, 16GB RAM, no confirmed GPU passthrough (AMD GPU present but ROCm isn't
   officially supported under WSL2, and this sandboxed shell couldn't detect `/dev/dri` at all).
@@ -23,8 +34,14 @@ the point is "runs on your own hardware," so there's nothing to host).
   the 16GB RAM budget — see README's "Design decisions" section for the quantization tradeoff.
 
 ## Remaining/optional work (not started, not blocking)
-- No auth — fine for a single-user local tool, would need it before any multi-user exposure.
 - No conversation persistence — chat history lives only in the browser tab.
 - No reranking step — plain top-k cosine similarity via sqlite-vec; would matter more at a
   much larger document count than this is designed for.
 - Portfolio site (`~/portfolio-site/projects/`) does not yet have an entry linking to this repo.
+- CI workflow (`.github/workflows/ci.yml`) is written and locally verified (ruff, pip-audit,
+  and a manual Trivy scan against the built image all pass) but has never actually run in
+  GitHub Actions — no remote configured yet for this repo.
+- Other DevOps/sysadmin hardening tracks discussed but not done: CI beyond lint/scan (no test
+  suite exists yet), a systemd/bare-metal deployment path, and wiring monitoring into the
+  existing `keycloak-zabbix-monitoring` repo. See [[user_job_search]] memory for the full list
+  if resuming this.

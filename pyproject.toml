@@ -10,6 +10,12 @@ dependencies = [
     "pypdf>=5.0",
     "python-multipart>=0.0.12",
     "sqlite-vec>=0.1.6",
+    "slowapi>=0.1.9",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
 ]
 
 [tool.uv]

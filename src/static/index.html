@@ -196,6 +196,26 @@ const fileInput = document.getElementById('fileInput');
 let history = [];
 let welcomed = false;
 
+function getApiKey() {
+  let key = localStorage.getItem('apiKey');
+  if (!key) {
+    key = window.prompt('Enter API key (set via ./scripts/init_env.sh):') || '';
+    localStorage.setItem('apiKey', key);
+  }
+  return key;
+}
+
+async function apiFetch(url, opts = {}) {
+  opts.headers = { ...(opts.headers || {}), 'X-API-Key': getApiKey() };
+  let res = await fetch(url, opts);
+  if (res.status === 401) {
+    localStorage.removeItem('apiKey');
+    opts.headers['X-API-Key'] = getApiKey();
+    res = await fetch(url, opts);
+  }
+  return res;
+}
+
 function clearWelcome() {
   if (!welcomed) { messagesEl.innerHTML = ''; welcomed = true; }
 }
@@ -227,7 +247,7 @@ function addCitations(container, sources) {
 }
 
 async function refreshSources() {
-  const res = await fetch('/api/sources');
+  const res = await apiFetch('/api/sources');
   const data = await res.json();
   if (!data.sources.length) {
     sourceListEl.innerHTML = '<p class="empty-note">No documents ingested yet.</p>';
@@ -241,7 +261,7 @@ async function refreshSources() {
     const btn = document.createElement('button');
     btn.textContent = '✕';
     btn.onclick = async () => {
-      await fetch(`/api/sources/${encodeURIComponent(s)}`, { method: 'DELETE' });
+      await apiFetch(`/api/sources/${encodeURIComponent(s)}`, { method: 'DELETE' });
       refreshSources();
     };
     item.appendChild(btn);
@@ -255,7 +275,12 @@ async function uploadFiles(files) {
     const fd = new FormData();
     fd.append('file', file);
     try {
-      await fetch('/api/ingest', { method: 'POST', body: fd });
+      const res = await apiFetch('/api/ingest', { method: 'POST', body: fd });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        statusEl.textContent = `Failed to ingest ${file.name}: ${err.detail || res.statusText}`;
+        continue;
+      }
     } catch (e) {
       statusEl.textContent = `Failed to ingest ${file.name}`;
       return;
@@ -284,7 +309,7 @@ form.addEventListener('submit', async e => {
   addMessage('user', text);
   const assistantBubble = addMessage('assistant', '');
 
-  const res = await fetch('/api/chat', {
+  const res = await apiFetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: text, history }),

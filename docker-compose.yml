@@ -1,26 +1,40 @@
 services:
+  # No host port published: Ollama is only reachable from the app container over
+  # the internal compose network. Nothing outside this stack can hit the model
+  # server directly (it has no auth of its own).
   ollama:
     image: ollama/ollama:latest
     volumes:
       - ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
 
   app:
     build: .
     depends_on:
       - ollama
+    # Loopback-only by default — this is a private single-user tool, not a
+    # service meant to be reachable from the LAN. Change to "8001:8000" if you
+    # deliberately want LAN access (and put a reverse proxy + TLS in front of it).
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_CHAT_MODEL=${OLLAMA_CHAT_MODEL:-llama3.1:8b-instruct-q4_K_M}
       - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       - DB_PATH=/app/data/db/vectors.db
+      - API_KEY=${API_KEY:?API_KEY is required — run ./scripts/init_env.sh first}
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   ollama_data:

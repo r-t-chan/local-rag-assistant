@@ -2,12 +2,16 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from . import ingest, llm, rag
+from .security import limiter, safe_filename, validate_upload, verify_api_key
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -19,6 +23,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Local RAG Assistant", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -40,28 +47,32 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
-@app.get("/api/sources")
+@app.get("/api/sources", dependencies=[Depends(verify_api_key)])
 def sources():
     return {"sources": rag.list_sources()}
 
 
-@app.delete("/api/sources/{source}")
+@app.delete("/api/sources/{source}", dependencies=[Depends(verify_api_key)])
 def delete_source(source: str):
     rag.delete_source(source)
     return {"deleted": source}
 
 
-@app.post("/api/ingest")
-async def ingest_endpoint(file: UploadFile = File(...)):
+@app.post("/api/ingest", dependencies=[Depends(verify_api_key)])
+@limiter.limit("10/minute")
+async def ingest_endpoint(request: Request, file: UploadFile = File(...)):
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
-    n_chunks = await ingest.ingest_file(file.filename, content)
-    return {"filename": file.filename, "chunks": n_chunks}
+    filename = safe_filename(file.filename)
+    validate_upload(filename, content)
+    n_chunks = await ingest.ingest_file(filename, content)
+    return {"filename": filename, "chunks": n_chunks}
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
+@app.post("/api/chat", dependencies=[Depends(verify_api_key)])
+@limiter.limit("30/minute")
+async def chat(request: Request, req: ChatRequest):
     query_embedding = await llm.embed(req.message)
     results = rag.search(query_embedding, k=4)
     context = "\n\n".join(
