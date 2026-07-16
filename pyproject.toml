@@ -1,0 +1,16 @@
+[project]
+name = "local-rag-assistant"
+version = "0.1.0"
+description = "Private, locally-hosted RAG assistant over your own documents"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    "pypdf>=5.0",
+    "python-multipart>=0.0.12",
+    "sqlite-vec>=0.1.6",
+]
+
+[tool.uv]
+package = false

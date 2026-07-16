@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local RAG Assistant</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161923;
+    --panel-2: #1e2230;
+    --border: #2a2f3f;
+    --text: #e7e9ee;
+    --text-dim: #8b90a3;
+    --accent: #6ea8fe;
+    --accent-dim: #3a5b8a;
+    --user-bubble: #2a3550;
+    --assistant-bubble: #1e2230;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  }
+  .app {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    height: 100vh;
+  }
+  .sidebar {
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow-y: auto;
+  }
+  .sidebar h1 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    letter-spacing: 0.02em;
+  }
+  .sidebar .sub {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin: 0 0 8px;
+    line-height: 1.4;
+  }
+  .dropzone {
+    border: 1.5px dashed var(--border);
+    border-radius: 10px;
+    padding: 18px 12px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .dropzone:hover, .dropzone.drag {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  .dropzone input { display: none; }
+  .source-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+  }
+  .source-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--panel-2);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12.5px;
+  }
+  .source-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .source-item button {
+    background: none; border: none; color: var(--text-dim);
+    cursor: pointer; font-size: 13px; padding: 0 0 0 8px;
+  }
+  .source-item button:hover { color: #f87171; }
+  .empty-note { font-size: 12px; color: var(--text-dim); font-style: italic; }
+  .status { font-size: 11px; color: var(--text-dim); }
+
+  .main {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 28px 20%;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  @media (max-width: 900px) { .messages { padding: 20px 6%; } }
+  .msg { max-width: 80%; display: flex; flex-direction: column; gap: 6px; }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .msg.assistant { align-self: flex-start; align-items: flex-start; }
+  .bubble {
+    padding: 12px 16px;
+    border-radius: 14px;
+    line-height: 1.5;
+    font-size: 14.5px;
+    white-space: pre-wrap;
+  }
+  .msg.user .bubble { background: var(--user-bubble); border-bottom-right-radius: 4px; }
+  .msg.assistant .bubble { background: var(--assistant-bubble); border-bottom-left-radius: 4px; }
+  .citations {
+    display: flex; gap: 6px; flex-wrap: wrap;
+  }
+  .citation {
+    font-size: 11px;
+    color: var(--accent);
+    background: rgba(110, 168, 254, 0.1);
+    border: 1px solid var(--accent-dim);
+    border-radius: 999px;
+    padding: 2px 9px;
+  }
+  .composer {
+    border-top: 1px solid var(--border);
+    padding: 16px 20%;
+  }
+  @media (max-width: 900px) { .composer { padding: 12px 6%; } }
+  .composer form {
+    display: flex; gap: 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 8px 8px 8px 16px;
+  }
+  .composer textarea {
+    flex: 1; background: none; border: none; color: var(--text);
+    font-size: 14.5px; font-family: inherit; resize: none;
+    outline: none; padding: 8px 0; max-height: 140px;
+  }
+  .composer button {
+    background: var(--accent); color: #0f1115; border: none;
+    border-radius: 8px; padding: 0 18px; font-weight: 600; font-size: 13.5px;
+    cursor: pointer;
+  }
+  .composer button:disabled { opacity: 0.5; cursor: default; }
+  .welcome {
+    color: var(--text-dim); font-size: 13.5px; text-align: center; margin-top: 40px;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div>
+      <h1>Local RAG Assistant</h1>
+      <p class="sub">Runs entirely on this machine. Nothing you upload or ask leaves your network.</p>
+    </div>
+    <label class="dropzone" id="dropzone">
+      <input type="file" id="fileInput" accept=".pdf,.txt,.md" multiple>
+      Drop files here or click to upload<br><span style="opacity:.7">.pdf .txt .md</span>
+    </label>
+    <div class="source-list" id="sourceList">
+      <p class="empty-note">No documents ingested yet.</p>
+    </div>
+    <p class="status" id="status"></p>
+  </aside>
+
+  <main class="main">
+    <div class="messages" id="messages">
+      <p class="welcome">Upload a document, then ask a question about it.</p>
+    </div>
+    <div class="composer">
+      <form id="chatForm">
+        <textarea id="input" rows="1" placeholder="Ask about your documents..."></textarea>
+        <button type="submit" id="sendBtn">Send</button>
+      </form>
+    </div>
+  </main>
+</div>
+
+<script>
+const messagesEl = document.getElementById('messages');
+const sourceListEl = document.getElementById('sourceList');
+const statusEl = document.getElementById('status');
+const form = document.getElementById('chatForm');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('sendBtn');
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+
+let history = [];
+let welcomed = false;
+
+function clearWelcome() {
+  if (!welcomed) { messagesEl.innerHTML = ''; welcomed = true; }
+}
+
+function addMessage(role, text) {
+  clearWelcome();
+  const msg = document.createElement('div');
+  msg.className = `msg ${role}`;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+  msg.appendChild(bubble);
+  messagesEl.appendChild(msg);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return bubble;
+}
+
+function addCitations(container, sources) {
+  if (!sources || !sources.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'citations';
+  sources.forEach(s => {
+    const c = document.createElement('span');
+    c.className = 'citation';
+    c.textContent = s;
+    wrap.appendChild(c);
+  });
+  container.parentElement.appendChild(wrap);
+}
+
+async function refreshSources() {
+  const res = await fetch('/api/sources');
+  const data = await res.json();
+  if (!data.sources.length) {
+    sourceListEl.innerHTML = '<p class="empty-note">No documents ingested yet.</p>';
+    return;
+  }
+  sourceListEl.innerHTML = '';
+  data.sources.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'source-item';
+    item.innerHTML = `<span title="${s}">${s}</span>`;
+    const btn = document.createElement('button');
+    btn.textContent = '✕';
+    btn.onclick = async () => {
+      await fetch(`/api/sources/${encodeURIComponent(s)}`, { method: 'DELETE' });
+      refreshSources();
+    };
+    item.appendChild(btn);
+    sourceListEl.appendChild(item);
+  });
+}
+
+async function uploadFiles(files) {
+  for (const file of files) {
+    statusEl.textContent = `Ingesting ${file.name}...`;
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      await fetch('/api/ingest', { method: 'POST', body: fd });
+    } catch (e) {
+      statusEl.textContent = `Failed to ingest ${file.name}`;
+      return;
+    }
+  }
+  statusEl.textContent = '';
+  refreshSources();
+}
+
+dropzone.addEventListener('change', e => uploadFiles(e.target.files));
+['dragover', 'dragleave', 'drop'].forEach(evt => {
+  dropzone.addEventListener(evt, e => {
+    e.preventDefault();
+    dropzone.classList.toggle('drag', evt === 'dragover');
+  });
+});
+dropzone.addEventListener('drop', e => uploadFiles(e.dataTransfer.files));
+
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  sendBtn.disabled = true;
+
+  addMessage('user', text);
+  const assistantBubble = addMessage('assistant', '');
+
+  const res = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: text, history }),
+  });
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let full = '';
+  let sourcesUsed = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const evt = JSON.parse(line.slice(6));
+      if (evt.type === 'sources') sourcesUsed = evt.sources;
+      if (evt.type === 'token') {
+        full += evt.text;
+        assistantBubble.textContent = full;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+    }
+  }
+
+  addCitations(assistantBubble, sourcesUsed);
+  history.push({ role: 'user', content: text });
+  history.push({ role: 'assistant', content: full });
+  sendBtn.disabled = false;
+  input.focus();
+});
+
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    form.requestSubmit();
+  }
+});
+
+refreshSources();
+</script>
+</body>
+</html>
