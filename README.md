@@ -133,6 +133,23 @@ design), TLS termination (add a reverse proxy in front if exposing beyond loopba
 and defending against a compromised/malicious *model* itself (Ollama and the model weights
 are a trusted part of this stack, not something the app sandboxes against).
 
+## CI/CD
+
+`.github/workflows/ci.yml` runs on every push/PR:
+
+1. **lint-and-audit** — `ruff check`, then `pip-audit` against the locked dependency set
+2. **container-scan** — builds the image, scans it with Trivy (fails on fixable CRITICAL/HIGH CVEs)
+3. **publish** — *only* on `main`, and only after both jobs above pass on that commit —
+   builds and pushes the image to GHCR (`ghcr.io/<owner>/local-rag-assistant`), tagged
+   `latest` and with the commit SHA
+
+The ordering is deliberate: nothing gets published without having been scanned first, and
+nothing gets scanned-and-discarded on a PR branch that never reaches `main`.
+
+`.github/dependabot.yml` opens weekly update PRs for Python dependencies (`uv`/`pyproject.toml`),
+the base Docker image, and the Action versions used in CI — so version bumps go through the
+same lint/audit/scan gate as any other change, rather than drifting silently.
+
 ## Stack
 
 FastAPI · Ollama (Llama 3.1 8B / Mistral 7B, quantized GGUF) · sqlite-vec ·

@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # uv reads dependency versions from pyproject.toml; Dependabot's "pip"
+  # ecosystem understands uv.lock/pyproject.toml for update PRs.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
