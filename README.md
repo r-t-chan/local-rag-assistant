@@ -87,6 +87,57 @@ OLLAMA_CHAT_MODEL=llama3.2:3b OLLAMA_EMBED_MODEL=nomic-embed-text docker compose
 ./scripts/setup_models.sh
 ```
 
+## Bare-metal / systemd deployment
+
+Docker Compose is the primary path, but the app runs equally well as a native systemd
+service — useful if you're deploying onto a host that's otherwise bare-metal, or if you
+just want to see it run outside a container. Unit files live in `deploy/systemd/`.
+
+1. **Install Ollama natively**: `curl -fsSL https://ollama.com/install.sh | sh` — this
+   sets up its own `ollama.service` systemd unit automatically, no extra work needed there.
+2. **Create a dedicated system user** (least privilege — the service shouldn't run as
+   your login user or root):
+   ```bash
+   sudo useradd --system --create-home --home-dir /opt/local-rag-assistant --shell /usr/sbin/nologin rag
+   ```
+3. **Deploy the app**:
+   ```bash
+   sudo -u rag git clone <this-repo> /opt/local-rag-assistant
+   cd /opt/local-rag-assistant
+   sudo -u rag uv sync --frozen --no-dev
+   ```
+4. **Environment file** at `/etc/local-rag-assistant.env` (root-owned, `chmod 600` — it
+   holds the API key):
+   ```bash
+   API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(24))")
+   OLLAMA_HOST=http://127.0.0.1:11434
+   OLLAMA_CHAT_MODEL=llama3.1:8b-instruct-q4_K_M
+   OLLAMA_EMBED_MODEL=nomic-embed-text
+   DB_PATH=/opt/local-rag-assistant/data/db/vectors.db
+   LOG_LEVEL=INFO
+   ```
+5. **Install and start the service**:
+   ```bash
+   sudo cp deploy/systemd/local-rag-assistant.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now local-rag-assistant
+   ```
+
+`deploy/systemd/local-rag-assistant.service`'s sandboxing directives
+(`ProtectSystem=strict`, `CapabilityBoundingSet=`, `NoNewPrivileges=true`, etc.) are the
+systemd-native equivalent of the container's non-root/read-only/cap-drop posture — same
+threat model, different mechanism, since there's no container boundary to lean on here.
+
+**Logs**: stdout goes to journald automatically — `journalctl -u local-rag-assistant -f`
+to tail. To cap retention (journald's default can grow unbounded), add a drop-in:
+```bash
+# /etc/systemd/journald.conf.d/local-rag-assistant.conf
+[Journal]
+SystemMaxUse=500M
+```
+
+**Backups**: see `scripts/backup_vectordb.sh` and `deploy/systemd/local-rag-assistant-backup.{service,timer}` below.
+
 ## API
 
 All `/api/*` endpoints require an `X-API-Key` header (see Security below).
@@ -113,6 +164,16 @@ All `/api/*` endpoints require an `X-API-Key` header (see Security below).
   ingest, `retrieved_count` on chat). Deliberately does **not** log document content or
   chat message text, consistent with this being a privacy-focused tool. Set `LOG_LEVEL`
   to change verbosity.
+- **Backups**: `scripts/backup_vectordb.sh` backs up the sqlite vector db using SQLite's
+  own online backup API (via Python's `sqlite3` module) rather than a plain `cp` — safe
+  to run while the app is concurrently writing — then gzips it and prunes backups older
+  than `RETENTION_DAYS` (default 14). Works against either deployment, since the Docker
+  Compose setup bind-mounts the db to `./data/db/vectors.db` on the host.
+  - **systemd**: `deploy/systemd/local-rag-assistant-backup.{service,timer}` run it daily.
+  - **cron** (e.g. for a Docker-only host with no systemd units installed):
+    ```
+    0 3 * * * cd /path/to/local-rag-assistant && ./scripts/backup_vectordb.sh >> /var/log/local-rag-backup.log 2>&1
+    ```
 
 ## Security
 
