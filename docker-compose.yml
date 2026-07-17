@@ -21,6 +21,35 @@ services:
       retries: 5
       start_period: 30s
 
+  # One-shot: guarantees data/kiwix/library.xml exists before kiwix-serve
+  # starts. Without this, a fresh clone (or an existing deployment pulling
+  # this feature for the first time, having never run init_env.sh again)
+  # bind-mounts a *missing* host file — Docker's default behavior in that
+  # case is to silently create a directory at that path instead of a file,
+  # which then makes kiwix-serve fail to start at all, which in turn blocks
+  # `app` forever (verified directly). Mounting the parent directory here
+  # instead of the file avoids that ambiguity, and this container just
+  # ensures the file inside it is real before the main service depends on it.
+  kiwix-init:
+    image: ghcr.io/kiwix/kiwix-serve:latest
+    # Root, not the image's default uid 1001: the bind-mounted host directory
+    # is owned by whatever user ran `docker compose up`, and a fixed non-root
+    # uid baked into the image has no guarantee of write access to it
+    # (verified directly — 1001 got a bare "Permission denied" against a
+    # normal 755 host directory). This container does nothing but write one
+    # small file and exit, so running that briefly as root is a reasonable
+    # trade for not depending on host/image uid alignment.
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /config/library.xml ]; then
+          printf '<?xml version="1.0" encoding="UTF-8" ?>\n<library version="20110515">\n</library>\n' > /config/library.xml
+        fi
+    volumes:
+      - ./data/kiwix:/config
+    restart: "no"
+
   # No host port published, same reasoning as Ollama: kiwix-serve has no auth
   # of its own, so only the app container should be able to reach it.
   #
@@ -29,13 +58,19 @@ services:
   # files are present (verified directly) — a real problem since downloading
   # Wikipedia is meant to be optional. --monitorLibrary hot-reloads the
   # manifest, so scripts/download_wikipedia_zim.sh registering a new ZIM via
-  # kiwix-manage doesn't require restarting this container.
+  # kiwix-manage doesn't require restarting this container. The library
+  # directory is mounted read-only here — this service only ever needs to
+  # read it; kiwix-manage (in the download script) writes it via a separate,
+  # writable mount of the same host directory.
   kiwix:
     image: ghcr.io/kiwix/kiwix-serve:latest
     command: ["--library", "--monitorLibrary", "/config/library.xml"]
+    depends_on:
+      kiwix-init:
+        condition: service_completed_successfully
     volumes:
       - ./data/zim:/data/zim:ro
-      - ./data/kiwix/library.xml:/config/library.xml
+      - ./data/kiwix:/config:ro
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -53,8 +88,13 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+      # service_started, not service_healthy: Kiwix is a soft dependency (see
+      # src/kiwix.py — every call degrades to [] on failure rather than
+      # raising), so a Kiwix outage or slow start shouldn't block the app
+      # from starting at all. Gating on service_healthy here would make the
+      # "soft dependency" design a lie at the infrastructure level.
       kiwix:
-        condition: service_healthy
+        condition: service_started
     # Loopback-only by default — this is a private single-user tool, not a
     # service meant to be reachable from the LAN. Change to "8001:8000" if you
     # deliberately want LAN access (and put a reverse proxy + TLS in front of it).

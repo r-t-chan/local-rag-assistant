@@ -75,47 +75,46 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+async def _ollama_reachable() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{llm.OLLAMA_HOST}/api/tags")
+            resp.raise_for_status()
+            return True
+    except httpx.HTTPError:
+        return False
+
+
+async def _kiwix_reachable() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{kiwix.KIWIX_HOST}/")
+            return resp.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
 @app.get("/health")
 async def health():
     """Unauthenticated liveness/readiness probe for the container orchestrator —
     checks that Ollama is actually reachable, not just that this process is up.
     Kiwix is reported but doesn't fail the check: it's a nice-to-have knowledge
-    source, and the app degrades gracefully (document-only answers) without it."""
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{llm.OLLAMA_HOST}/api/tags")
-            resp.raise_for_status()
-    except httpx.HTTPError:
+    source, and the app degrades gracefully (document-only answers) without it.
+    Both backends are probed concurrently rather than one after the other."""
+    ollama_up, kiwix_up = await asyncio.gather(_ollama_reachable(), _kiwix_reachable())
+    if not ollama_up:
         logger.warning("health check failed: ollama unreachable")
         raise HTTPException(503, "ollama unreachable")
-
-    kiwix_reachable = False
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{kiwix.KIWIX_HOST}/")
-            kiwix_reachable = resp.status_code == 200
-    except httpx.HTTPError:
-        pass
-
-    return {"status": "ok", "kiwix": "reachable" if kiwix_reachable else "unreachable"}
+    return {"status": "ok", "kiwix": "reachable" if kiwix_up else "unreachable"}
 
 
 @app.get("/metrics", dependencies=[Depends(verify_api_key)])
 async def metrics_endpoint():
     """API-key protected, unlike /health — request counts and ingest/chat
     activity are more sensitive than a bare up/down check."""
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{llm.OLLAMA_HOST}/api/tags")
-            metrics.OLLAMA_UP.set(1 if resp.status_code == 200 else 0)
-    except httpx.HTTPError:
-        metrics.OLLAMA_UP.set(0)
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{kiwix.KIWIX_HOST}/")
-            metrics.KIWIX_UP.set(1 if resp.status_code == 200 else 0)
-    except httpx.HTTPError:
-        metrics.KIWIX_UP.set(0)
+    ollama_up, kiwix_up = await asyncio.gather(_ollama_reachable(), _kiwix_reachable())
+    metrics.OLLAMA_UP.set(1 if ollama_up else 0)
+    metrics.KIWIX_UP.set(1 if kiwix_up else 0)
     return Response(metrics.render(), media_type=CONTENT_TYPE_LATEST)
 
 

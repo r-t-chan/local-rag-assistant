@@ -99,27 +99,59 @@ hardware, with no GPU dependency required?
   in testing, even when the ZIM clearly covered the topic (confirmed directly
   against kiwix-serve: the same query went from 0 results to 40 after just
   stripping stopwords). `src/kiwix.py::_keywords` strips a small stopword list
-  before searching.
+  before searching — using `\w+` rather than `[A-Za-z0-9']+`, so accented,
+  CJK, and Cyrillic queries keep their characters instead of being silently
+  stripped to nothing.
 - **Kiwix is a soft dependency, unlike Ollama**: `/health` fails (503) if Ollama
   is unreachable, since the app is useless without it, but only *reports* Kiwix's
   status without failing — the assistant still works, document-only, if Kiwix
-  is down. `src/kiwix.py::search` returns `[]` on any failure rather than raising.
+  is down. `src/kiwix.py::search` returns `[]` on any failure rather than raising,
+  and logs a warning so a misconfigured `KIWIX_HOST` doesn't look identical to
+  "no results." `app`'s own dependency on `kiwix` in `docker-compose.yml` is
+  `condition: service_started`, not `service_healthy` — a Kiwix outage or slow
+  start shouldn't block the app from starting at all, which `service_healthy`
+  would have done despite everything above being designed for graceful
+  degradation.
 - **`--library` mode over a `*.zim` glob**: the natural-looking `command: ["*.zim"]`
   approach *crash-loops kiwix-serve forever* the moment zero ZIM files are present
   (verified directly — the glob doesn't expand and kiwix-serve tries to open a
   literal file named `*.zim`), which would defeat the entire point of Wikipedia
-  being optional: skipping the download would hang the whole stack, since `app`
-  depends on `kiwix` reporting healthy. Instead, `kiwix-serve` runs against an XML
-  library manifest (`data/kiwix/library.xml`, bootstrapped empty by
-  `init_env.sh`) with `--monitorLibrary`, which starts cleanly with zero books and
-  hot-reloads when `download_wikipedia_zim.sh` registers a new one via
-  `kiwix-manage` — no restart needed, confirmed by registering a ZIM against a
-  running container and watching the catalog update live.
-- **`kiwix-manage` runs with `--user "$(id -u):$(id -g)"`**: the kiwix-serve image's
-  default user (uid 1001) can *read* the host-owned library file fine (that's all
-  the long-running service needs), but writing it — what `kiwix-manage add` does —
-  failed with a permission error until the one-off write ran as the host's own
-  user instead of the image's default.
+  being optional. Instead, `kiwix-serve` runs against an XML library manifest
+  (`data/kiwix/library.xml`) with `--monitorLibrary`, which starts cleanly with
+  zero books and hot-reloads when `download_wikipedia_zim.sh` registers a new
+  one via `kiwix-manage` — confirmed by registering a ZIM against a running
+  container and watching the same, still-running app pick it up with no restart.
+- **A one-shot `kiwix-init` service bootstraps the library file, not
+  `init_env.sh`**: a missing bind-mounted file is silently replaced by Docker
+  with an empty *directory*, which then makes kiwix-serve fail to start —
+  meaning any deployment that pulled this feature without re-running
+  `init_env.sh` would have `app` hang forever behind `kiwix`'s failed
+  healthcheck (verified directly). `kiwix-init` runs before `kiwix` on every
+  `docker compose up` and creates the file if it's missing, so there's no
+  "did you run the setup script" footgun at all. It runs as root
+  (`user: "0:0"`) rather than the image's default uid, since the bind-mounted
+  host directory's ownership can't be relied on to match a fixed non-root uid
+  baked into the image — confirmed by hitting exactly that permission error
+  with the default user.
+- **The book-name cache never stores an empty result**: the first version cached
+  "zero books found" the same way as a real result, which meant registering a
+  ZIM into a *running* app (the whole point of `--monitorLibrary`) never
+  actually got picked up until the app itself restarted — a bug that directly
+  contradicted the feature's own headline claim. Fixed by only caching non-empty
+  results; verified by registering a ZIM against a running app and confirming
+  the very next request found it with no restart.
+- **`kiwix-manage` writes to a temp file and renames it over the real one**,
+  rather than editing `library.xml` in place: kiwix-serve's `--monitorLibrary`
+  watches that file with read-only access while running, so an in-place edit
+  could be observed mid-write; a rename is atomic, so it only ever sees the old
+  complete file or the new complete file. The download script also runs
+  `kiwix-manage` with `--user "$(id -u):$(id -g)"`, since the kiwix-serve
+  image's default user (uid 1001) can *read* the host-owned library directory
+  fine but can't write it.
+- **The download script verifies a sha256 checksum** (Kiwix publishes one
+  alongside every ZIM) and downloads to a `.part` file with `curl -C -`
+  (resumable) before moving it into place, rather than trusting a ~12GB
+  transfer to have landed intact.
 
 ## Running it
 
@@ -132,9 +164,10 @@ docker compose up -d --build
 
 Then open http://localhost:8001 — the UI will prompt for the API key once (printed by
 `init_env.sh`, also in `.env`) and cache it in `localStorage`. Wikipedia search is optional
-— `init_env.sh` bootstraps an empty `data/kiwix/library.xml`, and kiwix-serve runs fine
-against it with zero books loaded (see the Kiwix section below for why that file has to
-exist at all, and why kiwix-serve is *not* just pointed at a `*.zim` glob).
+— a one-shot `kiwix-init` service bootstraps an empty `data/kiwix/library.xml` on every
+`docker compose up`, and kiwix-serve runs fine against it with zero books loaded (see the
+Kiwix section below for why that file has to exist at all, and why kiwix-serve is *not*
+just pointed at a `*.zim` glob).
 
 To use a different model size (e.g. for lower-RAM machines), override before starting:
 
@@ -209,11 +242,12 @@ All `/api/*` endpoints require an `X-API-Key` header (see Security below).
 
 ## Operations
 
-- **Healthchecks**: all three containers have Docker healthchecks (`ollama list` for
-  Ollama, a request to `/` for kiwix-serve, a request to `/health` for the app). `app`
-  won't start until both Ollama and Kiwix report healthy
-  (`depends_on.condition: service_healthy`), so there's no window where the app is up but
-  can't reach a dependency yet.
+- **Healthchecks**: all long-running containers have Docker healthchecks (`ollama list`
+  for Ollama, a request to `/` for kiwix-serve, a request to `/health` for the app). `app`
+  won't start until Ollama reports healthy (`condition: service_healthy` — a hard
+  dependency, since the app is useless without it), but only waits for Kiwix to have
+  *started* (`condition: service_started` — a soft dependency, since the app degrades to
+  document-only answers if Kiwix is unreachable rather than failing outright).
 - **Resource limits**: `mem_limit`/`cpus` are set on all three services — Ollama's
   ceiling (10GB) is sized for one 7-8B Q4 model plus the embedding model loaded
   concurrently, inside a 16GB host budget; raise it if you configure a larger model.

@@ -1,8 +1,13 @@
+import logging
 import os
 import re
 import xml.etree.ElementTree as ET
 
 import httpx
+
+from . import metrics
+
+logger = logging.getLogger("local_rag_assistant")
 
 KIWIX_HOST = os.environ.get("KIWIX_HOST", "http://localhost:8080")
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
@@ -26,8 +31,11 @@ def _keywords(query: str) -> str:
     matches nothing even when the content clearly covers it (verified: the
     same query minus stopwords went from 0 results to 40 against the same
     ZIM). Stripping stopwords/punctuation before searching consistently
-    finds what the raw question misses."""
-    words = re.findall(r"[A-Za-z0-9']+", query.lower())
+    finds what the raw question misses.
+
+    \\w+ (not [A-Za-z0-9']+) so accented/CJK/Cyrillic queries keep their
+    characters instead of being silently stripped to nothing."""
+    words = re.findall(r"\w+", query.lower(), flags=re.UNICODE)
     keywords = [w for w in words if w not in _STOPWORDS]
     return " ".join(keywords) or query
 
@@ -36,9 +44,14 @@ async def _discover_book_names(client: httpx.AsyncClient) -> list[str]:
     """kiwix-serve's /search endpoint wants the full content id (e.g.
     "wikipedia_en_ray-charles_mini_2026-05"), not the short book name — the
     catalog is the only place that id is exposed, so it's looked up once and
-    cached rather than requiring the operator to configure it by hand."""
+    cached rather than requiring the operator to configure it by hand.
+
+    An empty result is deliberately NOT cached: it means either no ZIM is
+    registered yet or the catalog was momentarily unreachable, and either
+    way the next search should look again rather than silently staying
+    empty forever once a ZIM does get registered."""
     global _book_names_cache
-    if _book_names_cache is not None:
+    if _book_names_cache:
         return _book_names_cache
     resp = await client.get(f"{KIWIX_HOST}/catalog/v2/entries")
     resp.raise_for_status()
@@ -50,7 +63,8 @@ async def _discover_book_names(client: httpx.AsyncClient) -> list[str]:
             if href.startswith("/content/"):
                 names.append(href.removeprefix("/content/"))
                 break
-    _book_names_cache = names
+    if names:
+        _book_names_cache = names
     return names
 
 
@@ -58,7 +72,8 @@ async def search(query: str, limit: int = 3) -> list[dict]:
     """Full-text search across every ZIM loaded into kiwix-serve. Returns []
     on any failure (unreachable, no books loaded, malformed response) —
     Wikipedia context is a nice-to-have for the chat endpoint, not a hard
-    dependency it should fail on."""
+    dependency it should fail on. Logs a warning on failure so a misconfigured
+    KIWIX_HOST or catalog problem doesn't look identical to "no results"."""
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             book_names = await _discover_book_names(client)
@@ -70,7 +85,13 @@ async def search(query: str, limit: int = 3) -> list[dict]:
             resp = await client.get(f"{KIWIX_HOST}/search", params=params)
             resp.raise_for_status()
             root = ET.fromstring(resp.content)
-    except (httpx.HTTPError, ET.ParseError):
+    except httpx.HTTPError as e:
+        logger.warning("kiwix search failed: unreachable", extra={"error": str(e)})
+        metrics.WIKIPEDIA_ERRORS.inc()
+        return []
+    except ET.ParseError as e:
+        logger.warning("kiwix search failed: malformed response", extra={"error": str(e)})
+        metrics.WIKIPEDIA_ERRORS.inc()
         return []
 
     channel = root.find("channel")
