@@ -1,0 +1,12 @@
+[Unit]
+Description=Backup local-rag-assistant vector database
+
+[Service]
+Type=oneshot
+User=rag
+Group=rag
+WorkingDirectory=/opt/local-rag-assistant
+Environment=DB_PATH=/opt/local-rag-assistant/data/db/vectors.db
+Environment=BACKUP_DIR=/opt/local-rag-assistant/data/backups
+Environment=RETENTION_DAYS=14
+ExecStart=/opt/local-rag-assistant/scripts/backup_vectordb.sh

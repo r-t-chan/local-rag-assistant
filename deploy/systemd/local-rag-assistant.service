@@ -1,0 +1,39 @@
+[Unit]
+Description=Local RAG Assistant (FastAPI app)
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=rag
+Group=rag
+WorkingDirectory=/opt/local-rag-assistant
+EnvironmentFile=/etc/local-rag-assistant.env
+ExecStart=/opt/local-rag-assistant/.venv/bin/uvicorn src.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+# Sandboxing directives — the bare-metal equivalent of the Docker deployment's
+# non-root user, read-only rootfs, and dropped capabilities (see
+# docker-compose.yml). Same threat model, different mechanism.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/local-rag-assistant/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -8,20 +8,33 @@ design-decision rationale (why Ollama, why sqlite-vec, why quantized 7-8B, etc).
 
 ## Status
 Working end-to-end: ingestion, chunking, embedding, retrieval, streaming chat, and citations
-all verified via `docker compose up` + manual curl tests. Not yet deployed anywhere public —
-it's a local Docker Compose app, not a hosted web service (that's a deliberate scope choice:
-the point is "runs on your own hardware," so there's nothing to host).
+all verified via `docker compose up` + manual curl tests. Docker Compose is the primary
+deployment path; a bare-metal/systemd path also exists (see below) as a secondary option.
 
-Security hardening pass complete (2026-07-16): API-key auth on all `/api/*` routes, rate
-limiting (slowapi), upload validation (extension allowlist + size cap + magic bytes), Ollama's
-port no longer published to the host, app container runs non-root/read-only/cap-dropped,
-multi-stage Docker build (no `pip`/`uv` in the final image), and CI (`pip-audit` + Trivy image
-scan). This was a deliberate pivot from "AI engineering demo" toward "DevOps/security portfolio
-piece" — see README's new Security section for the full threat model. All of it verified live
-(not just written), including a real bug caught during testing: a stale root-owned sqlite file
-from before the non-root user change broke writes under `read_only: true` until removed —
-worth remembering if `data/db/vectors.db` ever throws "attempt to write a readonly database"
-again after changing container user/permissions.
+Pushed to GitHub as a **private** repo: `r-t-chan/local-rag-assistant`. Workflow going forward
+is feature branch → PR → user reviews/merges (not direct-to-main), except for genuinely urgent
+one-line hotfixes (e.g. the trivy-action version pin fix on 2026-07-16, done directly on main).
+
+Security hardening pass complete (2026-07-16, merged to main): API-key auth on all `/api/*`
+routes, rate limiting (slowapi), upload validation (extension allowlist + size cap + magic
+bytes), Ollama's port no longer published to the host, app container runs
+non-root/read-only/cap-dropped, multi-stage Docker build, CI (`pip-audit` + Trivy image scan).
+Real bug caught during testing: a stale root-owned sqlite file from before the non-root user
+change broke writes under `read_only: true` until removed — worth remembering if
+`data/db/vectors.db` ever throws "attempt to write a readonly database" again after changing
+container user/permissions.
+
+DevOps track complete (2026-07-16, merged via PR #1 + PR #2): Docker healthchecks +
+`depends_on: condition: service_healthy`, resource limits, `/health` endpoint, structured JSON
+logging, CI publish job (GHCR, gated behind lint/audit/scan), Dependabot. Also: the CI's
+`trivy-action@0.24.0` pin was invalid all along (real tag is `v0.24.0` with a "v" prefix,
+confirmed via `git ls-remote --tags` when the API was degraded) — fixed by pinning to
+`v0.36.0`'s commit SHA instead of a mutable tag. `gh auth status`/some Actions API endpoints
+were flaky/false-negative during this session due to a real GitHub-side "Partially Degraded
+Service" incident (confirmed via githubstatus.com) — if `gh` misbehaves again, check
+githubstatus.com and try `git ls-remote`/direct `curl` before assuming local auth is broken.
+
+Sysadmin track in progress (2026-07-16) — see below.
 
 ## Environment notes
 - Developed on WSL2, 16GB RAM, no confirmed GPU passthrough (AMD GPU present but ROCm isn't
