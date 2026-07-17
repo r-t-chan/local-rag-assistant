@@ -3,6 +3,9 @@
 A private, fully local document Q&A assistant. Upload PDFs, notes, or markdown files
 and ask questions about them — the model, the embeddings, and the vector store all
 run on your own hardware. No document content or query ever leaves the machine.
+General-knowledge questions your documents don't cover can optionally draw on a local,
+offline Wikipedia copy (via [Kiwix](https://www.kiwix.org/)) — still no network calls
+at query time, just a second local knowledge source.
 
 ![status](https://img.shields.io/badge/status-working-brightgreen)
 
@@ -22,21 +25,26 @@ hardware, with no GPU dependency required?
 │  (chat UI)  │ ◀─────────────  │  (RAG logic) │ ◀───────────── │(models) │
 └─────────────┘   SSE stream    └──────┬───────┘   generate/    └─────────┘
                                         │            embeddings
-                                        ▼
-                                 ┌─────────────┐
-                                 │  sqlite-vec │
-                                 │ (vector db) │
-                                 └─────────────┘
+                                 ┌──────┴──────┐
+                                 ▼             ▼
+                          ┌─────────────┐  ┌──────────────┐
+                          │  sqlite-vec │  │ kiwix-serve  │
+                          │ (vector db) │  │ (Wikipedia)  │
+                          └─────────────┘  └──────────────┘
 ```
 
 1. **Ollama** serves both the chat model and the embedding model. One runtime, one
    container, no separate GPU-serving stack to maintain.
 2. **FastAPI app** handles ingestion (chunk → embed → store) and chat (embed query →
-   retrieve top-k chunks → build prompt → stream response back over SSE).
+   retrieve top-k chunks *and* search Wikipedia in parallel → build prompt → stream
+   response back over SSE).
 3. **sqlite-vec** is the vector store — a SQLite extension, not a separate database
    server. For a single-user local tool, running a Postgres/pgvector or Chroma
    server alongside would be pure overhead.
-4. **Static HTML/JS UI** — no frontend build step, deliberately. This is a tool, not
+4. **kiwix-serve** serves a downloaded Wikipedia ZIM dump — offline, no internet
+   dependency at query time — and exposes a full-text search API the app queries
+   alongside the document store.
+5. **Static HTML/JS UI** — no frontend build step, deliberately. This is a tool, not
    a product; a build pipeline would add complexity with no payoff here.
 
 ## Design decisions (and why)
@@ -68,17 +76,65 @@ hardware, with no GPU dependency required?
 - **The prompt explicitly instructs the model to say "I don't know" when the
   context doesn't cover the question** — grounding the model in retrieved context
   is what keeps a small local model from confidently hallucinating.
+- **Kiwix over a live Wikipedia API call**: Kiwix serves a downloaded ZIM dump —
+  fully offline, no network dependency at query time, consistent with "nothing
+  leaves the machine." A live API call would be simpler to wire up but would make
+  every chat request depend on internet access and wikipedia.org's availability.
+- **"mini" ZIM flavor over full/nopic**: the mini flavor (intro + infobox per
+  article, ~12GB for all of English Wikipedia) trades some depth on obscure topics
+  for a much smaller download than the ~56GB "nopic" (full article text) or
+  ~100GB+ "maxi" (with images) variants — a reasonable tradeoff for a text-based
+  Q&A assistant that doesn't render images anyway.
+- **Always query both sources and merge, rather than only falling back to
+  Wikipedia when document retrieval is weak**: a relevance-threshold heuristic
+  ("only search Wikipedia if document similarity is below X") is another
+  moving part that can misfire — too strict and Wikipedia never gets used, too
+  loose and it fires on every query anyway. Always-merge is simpler to reason
+  about, and the system prompt already tells the model documents are
+  authoritative and Wikipedia is background, so a good document match isn't
+  drowned out by unrelated Wikipedia snippets in practice.
+- **Kiwix's search needs keywords, not questions**: full-text search over a ZIM
+  is Xapian-based keyword matching, not semantic — passing a full question
+  verbatim (with stopwords and a trailing "?") frequently returned zero results
+  in testing, even when the ZIM clearly covered the topic (confirmed directly
+  against kiwix-serve: the same query went from 0 results to 40 after just
+  stripping stopwords). `src/kiwix.py::_keywords` strips a small stopword list
+  before searching.
+- **Kiwix is a soft dependency, unlike Ollama**: `/health` fails (503) if Ollama
+  is unreachable, since the app is useless without it, but only *reports* Kiwix's
+  status without failing — the assistant still works, document-only, if Kiwix
+  is down. `src/kiwix.py::search` returns `[]` on any failure rather than raising.
+- **`--library` mode over a `*.zim` glob**: the natural-looking `command: ["*.zim"]`
+  approach *crash-loops kiwix-serve forever* the moment zero ZIM files are present
+  (verified directly — the glob doesn't expand and kiwix-serve tries to open a
+  literal file named `*.zim`), which would defeat the entire point of Wikipedia
+  being optional: skipping the download would hang the whole stack, since `app`
+  depends on `kiwix` reporting healthy. Instead, `kiwix-serve` runs against an XML
+  library manifest (`data/kiwix/library.xml`, bootstrapped empty by
+  `init_env.sh`) with `--monitorLibrary`, which starts cleanly with zero books and
+  hot-reloads when `download_wikipedia_zim.sh` registers a new one via
+  `kiwix-manage` — no restart needed, confirmed by registering a ZIM against a
+  running container and watching the catalog update live.
+- **`kiwix-manage` runs with `--user "$(id -u):$(id -g)"`**: the kiwix-serve image's
+  default user (uid 1001) can *read* the host-owned library file fine (that's all
+  the long-running service needs), but writing it — what `kiwix-manage add` does —
+  failed with a permission error until the one-off write ran as the host's own
+  user instead of the image's default.
 
 ## Running it
 
 ```bash
-./scripts/init_env.sh       # generates a random API_KEY into .env (required — app refuses to start without it)
+./scripts/init_env.sh              # generates a random API_KEY into .env (required — app refuses to start without it)
+./scripts/download_wikipedia_zim.sh  # optional — ~12GB, skip if you only want document Q&A
 docker compose up -d --build
-./scripts/setup_models.sh   # pulls the chat + embedding models into the ollama container
+./scripts/setup_models.sh          # pulls the chat + embedding models into the ollama container
 ```
 
 Then open http://localhost:8001 — the UI will prompt for the API key once (printed by
-`init_env.sh`, also in `.env`) and cache it in `localStorage`.
+`init_env.sh`, also in `.env`) and cache it in `localStorage`. Wikipedia search is optional
+— `init_env.sh` bootstraps an empty `data/kiwix/library.xml`, and kiwix-serve runs fine
+against it with zero books loaded (see the Kiwix section below for why that file has to
+exist at all, and why kiwix-serve is *not* just pointed at a `*.zim` glob).
 
 To use a different model size (e.g. for lower-RAM machines), override before starting:
 
@@ -147,19 +203,20 @@ All `/api/*` endpoints require an `X-API-Key` header (see Security below).
 | `/api/ingest` | POST (multipart) | Upload a `.pdf`, `.txt`, or `.md` file — chunked, embedded, stored. 10MB cap, extension + magic-byte checked, rate-limited to 10/min. |
 | `/api/sources` | GET | List ingested document names |
 | `/api/sources/{name}` | DELETE | Remove a document and its chunks |
-| `/api/chat` | POST | `{message, history}` → SSE stream of `{type: sources|token|done}` events. Rate-limited to 30/min. |
-| `/health` | GET | Unauthenticated. Checks the app process is up *and* Ollama is actually reachable — used by the Compose healthcheck. |
-| `/metrics` | GET | Prometheus-format metrics (request counts/status by route, ingest/chat counters, live Ollama-reachable gauge). API-key protected, unlike `/health` — request volume and activity are more sensitive than a bare up/down check. |
+| `/api/chat` | POST | `{message, history}` → SSE stream of `{type: sources, documents: [...], wikipedia: [...]}`, `{type: token, text}`, then `{type: done}`. Rate-limited to 30/min. |
+| `/health` | GET | Unauthenticated. Checks the app process is up *and* Ollama is actually reachable — used by the Compose healthcheck. Also reports (non-fatally) whether Kiwix is reachable. |
+| `/metrics` | GET | Prometheus-format metrics (request counts/status by route, ingest/chat/Wikipedia counters, live Ollama- and Kiwix-reachable gauges). API-key protected, unlike `/health` — request volume and activity are more sensitive than a bare up/down check. |
 
 ## Operations
 
-- **Healthchecks**: both containers have Docker healthchecks (`ollama list` for Ollama,
-  a request to `/health` for the app). `app` won't start until Ollama reports healthy
+- **Healthchecks**: all three containers have Docker healthchecks (`ollama list` for
+  Ollama, a request to `/` for kiwix-serve, a request to `/health` for the app). `app`
+  won't start until both Ollama and Kiwix report healthy
   (`depends_on.condition: service_healthy`), so there's no window where the app is up but
-  can't reach the model yet.
-- **Resource limits**: `mem_limit`/`cpus` are set on both services — Ollama's ceiling
-  (10GB) is sized for one 7-8B Q4 model plus the embedding model loaded concurrently,
-  inside a 16GB host budget; raise it if you configure a larger model.
+  can't reach a dependency yet.
+- **Resource limits**: `mem_limit`/`cpus` are set on all three services — Ollama's
+  ceiling (10GB) is sized for one 7-8B Q4 model plus the embedding model loaded
+  concurrently, inside a 16GB host budget; raise it if you configure a larger model.
 - **Structured logging**: all logs are single-line JSON (`src/logging_config.py`) —
   timestamp, level, logger, message, plus any extra fields (e.g. `chunk_count` on
   ingest, `retrieved_count` on chat). Deliberately does **not** log document content or
@@ -274,8 +331,9 @@ same lint/audit/scan gate as any other change, rather than drifting silently.
 ## Stack
 
 FastAPI · Ollama (Llama 3.1 8B / Mistral 7B, quantized GGUF) · sqlite-vec ·
-vanilla HTML/CSS/JS · Docker Compose (or systemd) · slowapi (rate limiting) ·
-Trivy + pip-audit (CI scanning) · prometheus-client + Zabbix (monitoring)
+Kiwix (offline Wikipedia) · vanilla HTML/CSS/JS · Docker Compose (or systemd) ·
+slowapi (rate limiting) · Trivy + pip-audit (CI scanning) ·
+prometheus-client + Zabbix (monitoring)
 
 ## What's not here (yet)
 

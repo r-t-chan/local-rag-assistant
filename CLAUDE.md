@@ -34,7 +34,26 @@ were flaky/false-negative during this session due to a real GitHub-side "Partial
 Service" incident (confirmed via githubstatus.com) — if `gh` misbehaves again, check
 githubstatus.com and try `git ls-remote`/direct `curl` before assuming local auth is broken.
 
-Sysadmin track in progress (2026-07-16) — see below.
+Sysadmin track complete (2026-07-16, merged via PR #9 + PR #10) — see below.
+
+Wikipedia knowledge base added (2026-07-17, branch `feature/kiwix-wikipedia`): a Kiwix
+(`ghcr.io/kiwix/kiwix-serve`) service serves an offline Wikipedia ZIM dump, queried in
+parallel with the document store on every chat request (`src/kiwix.py`) and merged into
+the prompt with source labels. Two real bugs found and fixed during testing, not just
+written and assumed correct:
+1. Kiwix's full-text search is keyword-based (Xapian), not semantic — passing a raw
+   question (with stopwords, trailing "?") returned 0 results even when the ZIM clearly
+   covered the topic; confirmed directly (0 → 40 results for the same content after
+   stripping stopwords). Fixed with `src/kiwix.py::_keywords`.
+2. The initially-obvious `command: ["*.zim"]` glob approach crash-loops kiwix-serve
+   forever when zero ZIM files are present — which would've broken the entire "Wikipedia
+   is optional" premise, since `app` depends on `kiwix` reporting healthy. Fixed by
+   switching to `--library --monitorLibrary` mode against an XML manifest
+   (`data/kiwix/library.xml`, bootstrapped empty by `init_env.sh`), confirmed to start
+   clean with zero books and hot-reload live (no restart) once
+   `download_wikipedia_zim.sh` registers a ZIM via `kiwix-manage`. That registration
+   step itself needed `--user "$(id -u):$(id -g)"` — the image's default user (uid 1001)
+   can read the host-owned library file but not write it.
 
 ## Environment notes
 - Developed on WSL2, 16GB RAM, no confirmed GPU passthrough (AMD GPU present but ROCm isn't
@@ -62,7 +81,11 @@ route-template label (`/api/sources/{source}`) avoids per-filename cardinality b
 - No reranking step — plain top-k cosine similarity via sqlite-vec; would matter more at a
   much larger document count than this is designed for.
 - No test suite (pytest etc.) — everything verified via live docker-compose/curl smoke tests.
-- Portfolio site (`~/portfolio-site/projects/`) does not yet have an entry linking to this repo.
 - The Zabbix template has never been imported into a real Zabbix instance and verified end
   to end — it's been validated for YAML correctness and consistency with the existing
   keycloak template's conventions, but not exercised against live Zabbix.
+- The production Wikipedia ZIM (`wikipedia_en_all_mini_2026-06.zim`, ~12GB) has never
+  actually been downloaded/tested in this environment — all Kiwix testing used the ~700KB
+  `wikipedia_en_ray-charles_mini` fixture Kiwix itself uses for testing, to keep this
+  session's bandwidth/time reasonable. The mechanism is verified; the specific production
+  file is not.
