@@ -149,6 +149,7 @@ All `/api/*` endpoints require an `X-API-Key` header (see Security below).
 | `/api/sources/{name}` | DELETE | Remove a document and its chunks |
 | `/api/chat` | POST | `{message, history}` → SSE stream of `{type: sources|token|done}` events. Rate-limited to 30/min. |
 | `/health` | GET | Unauthenticated. Checks the app process is up *and* Ollama is actually reachable — used by the Compose healthcheck. |
+| `/metrics` | GET | Prometheus-format metrics (request counts/status by route, ingest/chat counters, live Ollama-reachable gauge). API-key protected, unlike `/health` — request volume and activity are more sensitive than a bare up/down check. |
 
 ## Operations
 
@@ -174,6 +175,49 @@ All `/api/*` endpoints require an `X-API-Key` header (see Security below).
     ```
     0 3 * * * cd /path/to/local-rag-assistant && ./scripts/backup_vectordb.sh >> /var/log/local-rag-backup.log 2>&1
     ```
+
+## Monitoring (Zabbix)
+
+`zabbix/template_local_rag_assistant_metrics.yaml` plugs this app into an existing Zabbix
+setup — same pattern as [`keycloak-zabbix-monitoring`](https://github.com/r-t-chan/keycloak-zabbix-monitoring):
+one HTTP agent item scrapes `/metrics`, dependent items pull out individual series via
+Zabbix's Prometheus pattern preprocessing, and triggers fire on the conditions that
+actually matter.
+
+```mermaid
+flowchart LR
+    app["App /metrics endpoint\n(Prometheus format)"]
+    master["Zabbix HTTP agent item\n(master — scrapes every 1m)"]
+    dep["Dependent items\nPrometheus pattern preprocessing"]
+    trig["Triggers\n(5xx rate, Ollama down,\nrate-limit abuse, endpoint down)"]
+    gchat["Google Chat space\n(existing webhook media type)"]
+    app --> master --> dep --> trig --> gchat
+```
+
+**What gets alerted on:**
+
+| Signal | Why it matters |
+|--------|-----------------|
+| Elevated 5xx rate | The app or Ollama is failing requests — check logs immediately |
+| Ollama backend unreachable | The app is up but useless without it — every chat/ingest call fails |
+| Sustained rate-limit rejections | A one-off burst is a real user; a sustained rate over 5m looks like scripted abuse against the API key |
+| Metrics endpoint unreachable | The monitoring itself is a dependency worth monitoring |
+
+Documents-ingested and chat-request rates are collected as informational usage/capacity
+trends, without alert thresholds.
+
+**Setup:**
+1. Import `zabbix/template_local_rag_assistant_metrics.yaml` into Zabbix (6.0+).
+2. Link it to a host that can reach the app's `/metrics` endpoint, and set the
+   `{$RAG.METRICS.URL}` and `{$RAG.API_KEY}` macros (the latter is a Secret Text macro —
+   use the same key from `.env`/`init_env.sh`).
+3. **Network note**: the app binds to `127.0.0.1` by default (see Security above). Either
+   run the Zabbix agent/proxy on the same host as the app, or deliberately expose the port
+   if your Zabbix server is elsewhere — same tradeoff called out in the port-binding
+   comment in `docker-compose.yml`.
+4. Reuse the existing Google Chat webhook media type from `keycloak-zabbix-monitoring`
+   for alert routing — no need for a second one just because it's a different app.
+5. Tune the `{$RAG.5XX.WARN}` / `{$RAG.RATELIMIT.WARN}` threshold macros to your baseline.
 
 ## Security
 
@@ -230,7 +274,8 @@ same lint/audit/scan gate as any other change, rather than drifting silently.
 ## Stack
 
 FastAPI · Ollama (Llama 3.1 8B / Mistral 7B, quantized GGUF) · sqlite-vec ·
-vanilla HTML/CSS/JS · Docker Compose · slowapi (rate limiting) · Trivy + pip-audit (CI scanning)
+vanilla HTML/CSS/JS · Docker Compose (or systemd) · slowapi (rate limiting) ·
+Trivy + pip-audit (CI scanning) · prometheus-client + Zabbix (monitoring)
 
 ## What's not here (yet)
 

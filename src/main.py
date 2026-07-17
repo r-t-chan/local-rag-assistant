@@ -5,15 +5,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-from . import ingest, llm, rag
+from . import ingest, llm, metrics, rag
 from .logging_config import configure_logging
 from .security import limiter, safe_filename, validate_upload, verify_api_key
 
@@ -35,6 +36,18 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def track_request_metrics(request: Request, call_next):
+    response = await call_next(request)
+    # Prefer the matched route template (e.g. "/api/sources/{source}") over the
+    # raw path, so per-request path segments (filenames) don't blow up label
+    # cardinality in Prometheus.
+    route = request.scope.get("route")
+    endpoint = route.path if route is not None else request.url.path
+    metrics.HTTP_REQUESTS.labels(endpoint=endpoint, status=response.status_code).inc()
+    return response
 
 
 class ChatRequest(BaseModel):
@@ -69,6 +82,19 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/metrics", dependencies=[Depends(verify_api_key)])
+async def metrics_endpoint():
+    """API-key protected, unlike /health — request counts and ingest/chat
+    activity are more sensitive than a bare up/down check."""
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{llm.OLLAMA_HOST}/api/tags")
+            metrics.OLLAMA_UP.set(1 if resp.status_code == 200 else 0)
+    except httpx.HTTPError:
+        metrics.OLLAMA_UP.set(0)
+    return Response(metrics.render(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/api/sources", dependencies=[Depends(verify_api_key)])
 def sources():
     return {"sources": rag.list_sources()}
@@ -90,6 +116,7 @@ async def ingest_endpoint(request: Request, file: UploadFile = File(...)):
     validate_upload(filename, content)
     n_chunks = await ingest.ingest_file(filename, content)
     logger.info("document ingested", extra={"source": filename, "chunk_count": n_chunks})
+    metrics.DOCUMENTS_INGESTED.inc()
     return {"filename": filename, "chunks": n_chunks}
 
 
@@ -106,6 +133,7 @@ async def chat(request: Request, req: ChatRequest):
         "chat request",
         extra={"retrieved_count": len(results), "source_count": len(sources_used)},
     )
+    metrics.CHAT_REQUESTS.inc()
 
     messages = [
         {
