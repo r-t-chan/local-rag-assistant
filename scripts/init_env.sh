@@ -2,6 +2,11 @@
 # Generates a random API key into .env if one doesn't already exist.
 # docker-compose.yml reads API_KEY from .env automatically and refuses to
 # start the app without it (fail closed, not open).
+#
+# Note: bootstrapping data/kiwix/library.xml is handled by the kiwix-init
+# service in docker-compose.yml, not here — that way it's self-healing on
+# every `docker compose up` (including for existing deployments that never
+# re-run this script) rather than a one-time setup step that's easy to miss.
 set -euo pipefail
 
 ENV_FILE=".env"

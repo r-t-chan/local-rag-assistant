@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-from . import ingest, llm, metrics, rag
+from . import ingest, kiwix, llm, metrics, rag
 from .logging_config import configure_logging
 from .security import limiter, safe_filename, validate_upload, verify_api_key
 
@@ -57,9 +58,15 @@ class ChatRequest(BaseModel):
 
 SYSTEM_PROMPT = (
     "You are a private, local document assistant. Answer the user's question "
-    "using ONLY the provided context below. If the context doesn't contain the "
-    "answer, say you don't know — do not make anything up. Cite sources by "
-    "filename when you use them.\n\nContext:\n{context}"
+    'using the context below. Content under "Your documents" is the user\'s '
+    "own uploaded material — treat it as authoritative. Content under "
+    '"Wikipedia (general knowledge)" comes from a local, offline Wikipedia '
+    "copy — use it to fill gaps only when the documents don't cover the "
+    "question, and prefer document content when both are relevant. If "
+    "neither source covers the question, say you don't know — do not make "
+    "anything up. Cite sources by name when you use them.\n\n"
+    "Your documents:\n{doc_context}\n\n"
+    "Wikipedia (general knowledge):\n{wiki_context}"
 )
 
 
@@ -68,30 +75,46 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
-@app.get("/health")
-async def health():
-    """Unauthenticated liveness/readiness probe for the container orchestrator —
-    checks that Ollama is actually reachable, not just that this process is up."""
+async def _ollama_reachable() -> bool:
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             resp = await client.get(f"{llm.OLLAMA_HOST}/api/tags")
             resp.raise_for_status()
+            return True
     except httpx.HTTPError:
+        return False
+
+
+async def _kiwix_reachable() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{kiwix.KIWIX_HOST}/")
+            return resp.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+@app.get("/health")
+async def health():
+    """Unauthenticated liveness/readiness probe for the container orchestrator —
+    checks that Ollama is actually reachable, not just that this process is up.
+    Kiwix is reported but doesn't fail the check: it's a nice-to-have knowledge
+    source, and the app degrades gracefully (document-only answers) without it.
+    Both backends are probed concurrently rather than one after the other."""
+    ollama_up, kiwix_up = await asyncio.gather(_ollama_reachable(), _kiwix_reachable())
+    if not ollama_up:
         logger.warning("health check failed: ollama unreachable")
         raise HTTPException(503, "ollama unreachable")
-    return {"status": "ok"}
+    return {"status": "ok", "kiwix": "reachable" if kiwix_up else "unreachable"}
 
 
 @app.get("/metrics", dependencies=[Depends(verify_api_key)])
 async def metrics_endpoint():
     """API-key protected, unlike /health — request counts and ingest/chat
     activity are more sensitive than a bare up/down check."""
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{llm.OLLAMA_HOST}/api/tags")
-            metrics.OLLAMA_UP.set(1 if resp.status_code == 200 else 0)
-    except httpx.HTTPError:
-        metrics.OLLAMA_UP.set(0)
+    ollama_up, kiwix_up = await asyncio.gather(_ollama_reachable(), _kiwix_reachable())
+    metrics.OLLAMA_UP.set(1 if ollama_up else 0)
+    metrics.KIWIX_UP.set(1 if kiwix_up else 0)
     return Response(metrics.render(), media_type=CONTENT_TYPE_LATEST)
 
 
@@ -124,28 +147,50 @@ async def ingest_endpoint(request: Request, file: UploadFile = File(...)):
 @limiter.limit("30/minute")
 async def chat(request: Request, req: ChatRequest):
     query_embedding = await llm.embed(req.message)
-    results = rag.search(query_embedding, k=4)
-    context = "\n\n".join(
-        f"[{r['source']} chunk {r['chunk_index']}]\n{r['text']}" for r in results
+    # Documents and Wikipedia are queried in parallel on every request — always
+    # blending both is simpler and more predictable than a relevance-threshold
+    # heuristic deciding when to fall back to Wikipedia (see README).
+    doc_results, wiki_results = await asyncio.gather(
+        asyncio.to_thread(rag.search, query_embedding, 4),
+        kiwix.search(req.message, limit=3),
     )
-    sources_used = sorted({r["source"] for r in results})
+
+    doc_context = "\n\n".join(
+        f"[{r['source']} chunk {r['chunk_index']}]\n{r['text']}" for r in doc_results
+    )
+    doc_sources = sorted({r["source"] for r in doc_results})
+
+    wiki_context = "\n\n".join(f"[{w['title']}]\n{w['snippet']}" for w in wiki_results)
+    wiki_sources = sorted({w["title"] for w in wiki_results})
+
+    metrics.CHAT_REQUESTS.inc()
+    metrics.WIKIPEDIA_QUERIES.inc()
+    if wiki_results:
+        metrics.WIKIPEDIA_HITS.inc()
     logger.info(
         "chat request",
-        extra={"retrieved_count": len(results), "source_count": len(sources_used)},
+        extra={
+            "retrieved_count": len(doc_results),
+            "source_count": len(doc_sources),
+            "wikipedia_hit_count": len(wiki_results),
+        },
     )
-    metrics.CHAT_REQUESTS.inc()
 
     messages = [
         {
             "role": "system",
-            "content": SYSTEM_PROMPT.format(context=context or "(no documents ingested yet)"),
+            "content": SYSTEM_PROMPT.format(
+                doc_context=doc_context or "(no documents ingested yet)",
+                wiki_context=wiki_context or "(no results)",
+            ),
         },
         *req.history,
         {"role": "user", "content": req.message},
     ]
 
     async def event_stream():
-        yield f"data: {json.dumps({'type': 'sources', 'sources': sources_used})}\n\n"
+        sources_event = {"type": "sources", "documents": doc_sources, "wikipedia": wiki_sources}
+        yield f"data: {json.dumps(sources_event)}\n\n"
         async for token in llm.stream_chat(messages):
             yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"

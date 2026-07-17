@@ -6,6 +6,10 @@ data/docs/*
 !data/docs/.gitkeep
 data/db/*
 !data/db/.gitkeep
+data/zim/*
+!data/zim/.gitkeep
+data/kiwix/*
+!data/kiwix/.gitkeep
 .env
 *.log
 .DS_Store
